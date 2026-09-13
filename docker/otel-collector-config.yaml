@@ -1,0 +1,45 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  transform/hidden_emails:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - replace_pattern(body, "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", "[OCULTO]")
+  batch: {}
+
+exporters:
+  otlp/traces:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlphttp/logs:
+    endpoint: http://alloy:4319
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: '0.0.0.0:8889'
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/traces]
+    logs:
+      receivers: [otlp]
+      processors: [transform/hidden_emails, batch]
+      exporters: [otlphttp/logs]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]

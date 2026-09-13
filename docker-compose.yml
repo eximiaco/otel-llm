@@ -1,0 +1,184 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: eximia_otel
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U admin -d eximia_otel']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      NODE_ENV: development
+      PORT: '3001'
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_USER: admin
+      DB_PASSWORD: '123456'
+      DB_NAME: eximia_otel
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_SERVICE_NAME: app
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
+      CHOKIDAR_USEPOLLING: 'true'
+      WATCHPACK_POLLING: 'true'
+    volumes:
+      - .:/app
+      - app_node_modules:/app/node_modules
+    ports:
+      - '3001:3001'
+    depends_on:
+      - postgres
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ['--config=/etc/otel-collector-config.yaml']
+    volumes:
+      - ./docker/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - '4317:4317'
+      - '4318:4318'
+      - '8889:8889'
+    depends_on:
+      - tempo
+      - loki
+      - alloy
+
+  prometheus:
+    image: prom/prometheus:v2.47.2
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - '9090:9090'
+    depends_on:
+      - otel-collector
+
+  tempo:
+    image: grafana/tempo:2.3.1
+    command: ['-config.file=/etc/tempo-config.yaml']
+    volumes:
+      - ./docker/tempo-config.yaml:/etc/tempo-config.yaml
+      - tempo_data:/tmp/tempo
+    ports:
+      - '3200:3200'
+
+  loki:
+    image: grafana/loki:3.0.0
+    user: '0'
+    command: -config.file=/etc/loki-config.yaml
+    volumes:
+      - ./docker/loki-config.yaml:/etc/loki-config.yaml
+      - loki_data:/tmp/loki
+    ports:
+      - '3100:3100'
+
+  alloy:
+    image: grafana/alloy:latest
+    volumes:
+      - ./docker/alloy-config.alloy:/etc/alloy/config.alloy
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: run --server.http.listen-addr=0.0.0.0:12345 --storage.path=/var/lib/alloy/data /etc/alloy/config.alloy
+    ports:
+      - '12345:12345'
+      - '4319:4319'
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    ports:
+      - '3000:3000'
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+
+  log-embedder:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedder
+    environment:
+      LOKI_URL: http://loki:3100
+      LOKI_QUERY: '{source="alloy-otel"}'
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_USER: admin
+      DB_PASSWORD: '123456'
+      DB_NAME: eximia_otel
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
+      EMBED_POLL_INTERVAL_MS: '30000'
+      EMBED_BATCH_SIZE: '32'
+      EMBED_LOOKBACK_HOURS: '24'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      loki:
+        condition: service_started
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.11.1
+    platform: linux/arm64
+    environment:
+      WEBUI_URL: http://localhost:3002
+      CORS_ALLOW_ORIGIN: http://localhost:3002
+      OFFLINE_MODE: 'true'
+      HF_HUB_OFFLINE: '1'
+      BYPASS_EMBEDDING_AND_RETRIEVAL: 'true'
+      ENABLE_OPENAI_API: 'true'
+      OPENAI_API_BASE_URLS: http://app:3001/v1
+      # O conector exige um valor não vazio; a API local não usa esta chave para chamar a OpenAI.
+      OPENAI_API_KEYS: ${WEBUI_INTERNAL_API_KEY:-local-adapter}
+      DEFAULT_MODELS: logs-qa
+      ENABLE_PERSISTENT_CONFIG: 'false'
+      ENABLE_OLLAMA_API: 'false'
+      WEBUI_AUTH: 'false'
+      WEBUI_SECRET_KEY: ${EXIMIA_WEBUI_SECRET_KEY:-local-webui-secret-change-me-1234567890}
+    volumes:
+      - open_webui_data:/app/backend/data
+    ports:
+      - '3002:8080'
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  app_node_modules:
+  postgres_data:
+  tempo_data:
+  loki_data:
+  grafana_data:
+  prometheus_data:
+  open_webui_data:
